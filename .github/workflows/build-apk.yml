@@ -1,0 +1,145 @@
+name: Build APK - The Dark Shard
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - "**.md"
+
+permissions:
+  contents: write
+
+env:
+  GODOT_VERSION: "4.3"
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Siapkan project (ekstrak ZIP kalau project masih berupa zip)
+        run: |
+          if [ -f project.godot ]; then
+            PD="."
+          else
+            Z=$(ls -1 *.zip 2>/dev/null | head -n 1 || true)
+            if [ -n "$Z" ]; then
+              echo "Mengekstrak $Z"
+              mkdir -p _proj
+              unzip -q -o "$Z" -d _proj
+            fi
+            PF=$(find . -name project.godot -not -path "./.git/*" | head -n 1)
+            if [ -z "$PF" ]; then
+              echo "project.godot tidak ditemukan. Upload the_dark_shard.zip ke root repo."
+              exit 1
+            fi
+            PD=$(dirname "$PF")
+          fi
+          echo "Project di: $PD"
+          echo "PROJECT_DIR=$PD" >> "$GITHUB_ENV"
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Siapkan Android SDK
+        run: |
+          export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
+          SDKM="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKM" ]; then
+            SDKM=$(find "$ANDROID_SDK_ROOT/cmdline-tools" -name sdkmanager | head -n 1)
+          fi
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platform-tools" "build-tools;34.0.0" "platforms;android-34" > /dev/null
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+
+      - name: Unduh Godot dan export template
+        run: |
+          B="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable"
+          curl -fsSL -o godot.zip "$B/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
+          curl -fsSL -o templates.tpz "$B/Godot_v${GODOT_VERSION}-stable_export_templates.tpz"
+          unzip -q godot.zip
+          mv "Godot_v${GODOT_VERSION}-stable_linux.x86_64" godot_bin
+          chmod +x godot_bin
+          mkdir -p "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
+          unzip -q templates.tpz -d tpl
+          mv tpl/templates/* "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable/"
+          ls "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable/" | head -n 20
+
+      - name: Unduh texture dan model (opsional)
+        continue-on-error: true
+        run: bash "$PROJECT_DIR/tools/fetch_assets.sh"
+
+      - name: Keystore debug dan pengaturan editor
+        run: |
+          keytool -genkeypair -v -keystore "$HOME/debug.keystore" -storepass android \
+            -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+          mkdir -p "$HOME/.config/godot"
+          cat > "$HOME/.config/godot/editor_settings-4.3.tres" <<EOF
+          [gd_resource type="EditorSettings" format=3]
+
+          [resource]
+          export/android/android_sdk_path = "$ANDROID_SDK_ROOT"
+          export/android/java_sdk_path = "$JAVA_HOME"
+          export/android/debug_keystore = "$HOME/debug.keystore"
+          export/android/debug_keystore_user = "androiddebugkey"
+          export/android/debug_keystore_pass = "android"
+          export/android/force_system_user = false
+          export/android/shutdown_adb_on_exit = true
+          EOF
+          cp "$HOME/.config/godot/editor_settings-4.3.tres" "$HOME/.config/godot/editor_settings-4.tres"
+          P="$PROJECT_DIR/export_presets.cfg"
+          sed -i "s|^keystore/debug=.*|keystore/debug=\"$HOME/debug.keystore\"|" "$P"
+          sed -i 's|^keystore/debug_user=.*|keystore/debug_user="androiddebugkey"|' "$P"
+          sed -i 's|^keystore/debug_password=.*|keystore/debug_password="android"|' "$P"
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PATH=$HOME/debug.keystore" >> "$GITHUB_ENV"
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_USER=androiddebugkey" >> "$GITHUB_ENV"
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD=android" >> "$GITHUB_ENV"
+
+      - name: Import project dan cek skrip
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          "$GITHUB_WORKSPACE/godot_bin" --headless --path . --import 2>&1 | tee "$GITHUB_WORKSPACE/import.log" || true
+          "$GITHUB_WORKSPACE/godot_bin" --headless --path . --import 2>&1 | tee -a "$GITHUB_WORKSPACE/import.log" || true
+          if grep -E "SCRIPT ERROR|Parse Error|Failed to load script" "$GITHUB_WORKSPACE/import.log"; then
+            echo "::warning::Ada error skrip GDScript, lihat log di atas."
+          fi
+
+      - name: Export APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/build"
+          "$GITHUB_WORKSPACE/godot_bin" --headless --path . --export-debug "Android" "$GITHUB_WORKSPACE/build/TheDarkShard.apk" 2>&1 | tee "$GITHUB_WORKSPACE/build/export.log"
+          test -f "$GITHUB_WORKSPACE/build/TheDarkShard.apk"
+          ls -la "$GITHUB_WORKSPACE/build"
+
+      - name: Upload APK (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: TheDarkShard-apk
+          path: build/TheDarkShard.apk
+
+      - name: Upload log kalau gagal
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            import.log
+            build/export.log
+
+      - name: Rilis APK (mudah diunduh dari HP)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: The Dark Shard build ${{ github.run_number }}
+          body: APK debug siap pasang. Buka tab Assets lalu unduh TheDarkShard.apk
+          files: build/TheDarkShard.apk
+          
